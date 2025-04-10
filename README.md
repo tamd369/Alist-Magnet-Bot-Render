@@ -96,7 +96,7 @@ docker restart thunderxbot
 
 如果你在 Render 上无法成功部署：
 
-- 可以在 [Releases](./releases) 中下载适用于其他平台（如 Minecraft 容器、Python 脚本环境）的版本  
+- 可以在 Releases 中下载适用于其他平台（如 Minecraft 容器、Python 脚本环境）的版本  
 - 每个版本的压缩包中都包含说明文件，按需配置即可使用
 
 ---
