@@ -92,12 +92,12 @@ nano /opt/thunderx_bot/config.json
 可以在 Releases 中下载适用于其他平台（如 Minecraft 容器、Python 运行环境）的版本
 压缩包內说明文件
 
-🙏 致谢
+## 🙏 致谢
 感谢以下群友对本项目的贡献与支持：
 
 - [群友Patty](https://t.me/joinchat/GZxTslH80phQbAR0bglMMA)提供原始 Python 脚本
 
-misaka：增强 /alean 指令，实现垃圾文件清理功能
+misaka：增强 /clean 指令，实现垃圾文件清理功能
 
 0721：用 Go 语言重写项目，并提供 Render 镜像与多平台 Docker 镜像支持
 - [eooce](https://github.com/eooce)
