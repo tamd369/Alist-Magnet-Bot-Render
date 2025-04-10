@@ -76,29 +76,38 @@ docker run -d --restart=unless-stopped \
   -v /opt/thunderx_bot:/app \
   --name="thunderxbot" \
   node8848/thunderxbot:latest
+```
 
-运行容器后，编辑配置文件
-`/opt/thunderx_bot/config.json`：
+运行容器后，编辑配置文件 `/opt/thunderx_bot/config.json`：
 
 ```bash
 nano /opt/thunderx_bot/config.json
+```
 
 填入你的配置信息后，重启容器以生效：
 
-`docker restart thunderxbot`
- 其他平台部署说明
+```bash
+docker restart thunderxbot
+```
+
+---
+
+## 🧩 其他平台部署说明
+
 如果你在 Render 上无法成功部署：
 
-可以在 Releases 中下载适用于其他平台（如 Minecraft 容器、Python 运行环境）的版本
-压缩包內说明文件
+- 可以在 [Releases](./releases) 中下载适用于其他平台（如 Minecraft 容器、Python 脚本环境）的版本  
+- 每个版本的压缩包中都包含说明文件，按需配置即可使用
+
+---
 
 ## 🙏 致谢
+
 感谢以下群友对本项目的贡献与支持：
 
-- [群友Patty](https://t.me/joinchat/GZxTslH80phQbAR0bglMMA)提供原始 Python 脚本
+- [**群友Patty**](https://t.me/joinchat/GZxTslH80phQbAR0bglMMA)：提供原始 Python 脚本  
+- **misaka**：增强 `/clean` 指令，实现垃圾文件清理功能  
+- **0721**：用 Go 语言重写项目，并提供 Render 镜像与多平台 Docker 镜像支持  
+- [**eooce**](https://github.com/eooce)：提供 Auto-keep-online 项目，实现 Render 自动保活
 
-misaka：增强 /clean 指令，实现垃圾文件清理功能
-
-0721：用 Go 语言重写项目，并提供 Render 镜像与多平台 Docker 镜像支持
-- [eooce](https://github.com/eooce)
-
+> 📌 本教程由热心用户整理，经作者同意整合发布，内容仅供参考，如有问题自行解决，各种AI或者群里问。
