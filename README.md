@@ -96,7 +96,7 @@ docker restart thunderxbot
 
 如果你在 Render 上无法成功部署：
 
-- 可以在 Releases 中下载适用于其他平台（如 Minecraft 容器、Python 脚本环境）的版本  
+- 可以在 Releases 中下载适用于其他平台（如 Minecraft 容器、Python、java脚本环境）的版本  
 - 每个版本的压缩包中都包含说明文件，按需配置即可使用
 
 ---
@@ -107,7 +107,8 @@ docker restart thunderxbot
 
 - [**群友Patty**](https://t.me/joinchat/GZxTslH80phQbAR0bglMMA)：提供原始 Python 脚本  
 - **misaka**：增强 `/clean` 指令，实现垃圾文件清理功能  
-- **0721**：用 Go 语言重写项目，并提供 Render 镜像与多平台 Docker 镜像支持  
+- **0721**：用 Go 语言重写项目，并提供 Render 镜像与多平台 Docker 镜像支持
+- [**月**](https://github.com/yyyr-otz)：重新编译支持java
 - [**eooce**](https://github.com/eooce)：提供 Auto-keep-online 项目，实现 Render 自动保活
 
-> 📌 本教程由热心用户整理，经作者同意整合发布，内容仅供参考，如有问题自行解决，各种AI或者群里问。
+> 📌 本教程由本人整理，经作者同意整合发布，内容仅供参考，如有问题自行解决，各种AI或者群里问。
