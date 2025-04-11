@@ -41,7 +41,7 @@
 
 | 环境变量名 | 示例值 | 说明 |
 |------------|--------|------|
-| `BOT_BASE_URL` | `http://127.0.0.1:5244` | Alist 的主页地址 |
+| `BOT_BASE_URL` | `http://127.0.0.1:5244/` | Alist 的主页地址需要/结尾 |
 | `BOT_SEARCH_URL` | `https://api.wwlww.org/v1/avcode/` | 用于搜索磁力链接的 API 地址 |
 | `BOT_USERNAME` | `alist用户名` | Alist 登录用户名 |
 | `BOT_PASSWORD` | `alist密码` | Alist 登录密码 |
