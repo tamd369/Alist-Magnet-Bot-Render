@@ -29,7 +29,7 @@
 
 | 项目         | 内容 |
 |--------------|------|
-| **Docker Image** | `node8848/thunderxbot-for-render:latest` |
+| **Docker Image** | `python:3.9` |
 | **Service Name** | 自定义，例如 `thunderxbot` |
 | **Region**       | 建议选择靠近你用户的区域，如 `Singapore` |
 
@@ -41,12 +41,14 @@
 
 | 环境变量名 | 示例值 | 说明 |
 |------------|--------|------|
-| `BOT_BASE_URL` | `http://127.0.0.1:5244/` | Alist 的主页地址需要/结尾 |
-| `BOT_SEARCH_URL` | `https://api.wwlww.org/v1/avcode/` | 用于搜索磁力链接的 API 地址 |
-| `BOT_USERNAME` | `alist用户名` | Alist 登录用户名 |
-| `BOT_PASSWORD` | `alist密码` | Alist 登录密码 |
-| `BOT_OFFLINE_DOWNLOAD_DIR` | `/thunderx` | Alist 设置的离线下载保存路径 |
-| `BOT_TELEGRAM_TOKEN` | `Telegram Bot 的 Token` | 在 @BotFather 创建 Bot 后获得 |
+| `ALIST_BASE_URL` | `http://127.0.0.1:5244/` | Alist 的主页地址需要/结尾 |
+| `JAV_SEARCH_API` | `https://api.wwlww.org/v1/avcode/` | 用于搜索磁力链接的 API 地址 |
+| `ALIST_USERNAME` | `alist用户名` | Alist 登录用户名 |
+| `ALIST_PASSWORD` | `alist密码` | Alist 登录密码 |
+| `ALIST_OFFLINE_DIR` | `/thunderx` | 离线下载保存路径 |
+| `TELEGRAM_TOKEN` | `Telegram Bot 的 Token` | 在 @BotFather 创建 Bot 后获得 |
+| `CLEAN_INTERVAL_MINUTES` | `60` | 自动清理间隔时间(分钟) |
+| `SIZE_THRESHOLD` | `100` | 触发清理的目录大小阈值(GB) |
 
 ✅ 填写完毕点击 `Deploy` 即可部署。
 
@@ -75,10 +77,16 @@ uptime,哪吒面板等工具增加监控任务也可以
 docker run -d --restart=unless-stopped \
   -v /opt/thunderx_bot:/app \
   --name="thunderxbot" \
-  node8848/thunderxbot:latest
+  -e BOT_BASE_URL=$BOT_BASE_URL \
+  -e BOT_SEARCH_URL=$BOT_SEARCH_URL \
+  -e BOT_USERNAME=$BOT_USERNAME \
+  -e BOT_PASSWORD=$BOT_PASSWORD \
+  -e BOT_OFFLINE_DOWNLOAD_DIR=$BOT_OFFLINE_DOWNLOAD_DIR \
+  -e BOT_TELEGRAM_TOKEN=$BOT_TELEGRAM_TOKEN \
+  python:3.9
 ```
 
-运行容器后，编辑配置文件 `/opt/thunderx_bot/config.json`：
+运行容器前，通过环境变量设置配置参数：
 
 ```bash
 nano /opt/thunderx_bot/config.json
