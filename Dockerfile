@@ -1,1 +1,20 @@
-FROM node8848/thunderxbot-for-render:latest
+FROM python:3.9
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+COPY misaka改进版/tgbot.py .
+
+ENV TELEGRAM_TOKEN=""
+ENV ALIST_BASE_URL=""
+ENV ALIST_USERNAME=""
+ENV ALIST_PASSWORD=""
+ENV ALIST_OFFLINE_DIR=""
+ENV JAV_SEARCH_API=""
+ENV ALLOWED_USER_IDS=""
+ENV CLEAN_INTERVAL_MINUTES="60"
+ENV SIZE_THRESHOLD="100"
+
+CMD ["python", "tgbot.py"]
