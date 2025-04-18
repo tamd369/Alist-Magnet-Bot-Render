@@ -7,24 +7,32 @@ import asyncio
 import ast
 import math
 import html
-from datetime import datetime
+import urllib.parse
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 from functools import wraps
 
 from telegram import Update
-from telegram.constants import ParseMode, ChatAction
+from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# 加载 .env 文件中的环境变量
+# 加载.env 文件中的环境变量
 load_dotenv()
 
-# 配置日志
+# 配置日志（增强过滤规则）
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
+
+# 禁止httpx的INFO级别日志（过滤HTTP/1.1 200 OK等信息）
+httpx_logger = logging.getLogger("httpx")
+httpx_logger.setLevel(logging.WARNING)  # 仅显示WARNING及以上级别日志
 
 # --- 从环境变量加载配置 ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -34,10 +42,14 @@ PASSWORD = os.getenv("ALIST_PASSWORD")
 OFFLINE_DOWNLOAD_DIR = os.getenv("ALIST_OFFLINE_DIR")
 SEARCH_URL = os.getenv("JAV_SEARCH_API")
 ALLOWED_USER_IDS_STR = os.getenv("ALLOWED_USER_IDS")
+# 新增：从.env 文件中加载自动清理间隔时间
+CLEAN_INTERVAL_MINUTES = int(os.getenv("CLEAN_INTERVAL_MINUTES", 60))
+# 新增：从.env 文件中加载清理阈值
+SIZE_THRESHOLD = int(os.getenv("SIZE_THRESHOLD", 100)) * 1024 * 1024
 
 # --- 配置校验 ---
 if not all([TELEGRAM_TOKEN, BASE_URL, USERNAME, PASSWORD, OFFLINE_DOWNLOAD_DIR, SEARCH_URL, ALLOWED_USER_IDS_STR]):
-    logger.error("错误：环境变量缺失！请检查 .env 文件或环境变量设置。")
+    logger.error("错误：环境变量缺失！请检查.env 文件或环境变量设置。")
     sys.exit(1)
 
 try:
@@ -48,10 +60,8 @@ except ValueError:
     logger.error("错误: ALLOWED_USER_IDS 格式不正确，请确保是逗号分隔的数字。")
     sys.exit(1)
 
-
-# --- 全局token缓存 ---
-# 使用 context.bot_data 来存储 token，更适合 PTB v20+
-# global_token = None # 不再使用全局变量
+# --- 全局配置 ---
+TOKEN_EXPIRY_DURATION = timedelta(hours=24)  # Token 有效期 24 小时
 
 # --- 用户授权装饰器 ---
 def restricted(func):
@@ -65,8 +75,8 @@ def restricted(func):
         # 检查并获取 token，存储在 bot_data 中
         token = await get_token(context)
         if not token:
-             await update.message.reply_text("错误: 无法连接或登录到 Alist 服务。")
-             return
+            await update.message.reply_text("错误: 无法连接或登录到 Alist 服务。")
+            return
         # 将 token 传递给处理函数
         return await func(update, context, token=token, *args, **kwargs)
     return wrapped
@@ -76,13 +86,13 @@ def restricted(func):
 def parse_size_to_bytes(size_str: str) -> int | None:
     """Converts size string (e.g., '5.40GB', '1.25MB') to bytes."""
     if not size_str:
-        return 0 # Treat empty size as 0 bytes
+        return 0  # Treat empty size as 0 bytes
 
     size_str = size_str.upper()
     match = re.match(r'^([\d.]+)\s*([KMGTPEZY]?B)$', size_str)
     if not match:
         logger.warning(f"无法解析文件大小: {size_str}")
-        return None # Indicate parsing failure
+        return None  # Indicate parsing failure
 
     value, unit = match.groups()
     try:
@@ -101,15 +111,12 @@ def parse_size_to_bytes(size_str: str) -> int | None:
         exponent = 3
     elif unit.startswith('T'):
         exponent = 4
-    # Add more if needed (P, E, Z, Y)
 
     return int(value * (1024 ** exponent))
 
-# --- Helper Function to Parse Data Entry ---
 def parse_api_data_entry(entry_str: str) -> dict | None:
     """Parses a single string entry from the API data list."""
     try:
-        # Safely evaluate the string representation of the list
         data_list = ast.literal_eval(entry_str)
         if not isinstance(data_list, list) or len(data_list) < 4:
             logger.warning(f"解析后的数据格式不正确 (非列表或长度不足): {data_list}")
@@ -118,25 +125,23 @@ def parse_api_data_entry(entry_str: str) -> dict | None:
         magnet = data_list[0]
         name = data_list[1]
         size_str = data_list[2]
-        date_str = data_list[3] # YYYY-MM-DD
+        date_str = data_list[3]
 
         if not magnet or not magnet.startswith("magnet:?"):
             logger.warning(f"条目中缺少有效的磁力链接: {entry_str}")
             return None
 
         size_bytes = parse_size_to_bytes(size_str)
-        if size_bytes is None: # Handle parsing failure
-             logger.warning(f"无法解析大小，跳过条目: {entry_str}")
-             return None # Skip entry if size is unparseable
+        if size_bytes is None:
+            logger.warning(f"无法解析大小，跳过条目: {entry_str}")
+            return None
 
-        # Parse date safely
         upload_date = None
         try:
             if date_str:
                 upload_date = datetime.strptime(date_str, '%Y-%m-%d').date()
         except ValueError:
             logger.warning(f"无法解析日期 '{date_str}'，日期将为 None")
-
 
         return {
             "magnet": magnet,
@@ -145,132 +150,98 @@ def parse_api_data_entry(entry_str: str) -> dict | None:
             "size_bytes": size_bytes,
             "date_str": date_str,
             "date": upload_date,
-            "original_string": entry_str # Keep original for logging if needed
+            "original_string": entry_str
         }
 
     except (ValueError, SyntaxError, TypeError) as e:
         logger.error(f"解析 API 数据条目时出错: '{entry_str[:100]}...', 错误: {e}")
         return None
 
-def get_magnet(fanhao, search_url):
+def get_magnet(fanhao: str, search_url: str) -> tuple[str | None, str | None]:
+    """获取磁力链接（优化版用户提示）"""
     try:
         url = search_url.rstrip('/') + "/" + fanhao
-        logger.info(f"正在搜索番号: {fanhao} 使用 URL: {url}")
-        response = requests.get(url, timeout=20)
+        logger.info(f"正在搜索番号: {fanhao}")
+        response = requests.get(url, timeout=20)  # 明确定义 response
         response.raise_for_status()
 
-        try:
-            raw_result = response.json()
-            logger.debug(f"API 原始响应文本 ({fanhao}): {response.text}")
-            logger.debug(f"API 解析后的 JSON ({fanhao}): {raw_result}")
-        except requests.exceptions.JSONDecodeError:
-            logger.error(f"错误: API ({url}) 返回的不是有效的 JSON。响应内容: {response.text}")
-            return None, "搜索服务暂时不可用 (返回格式错误)"
+        raw_result = response.json()
 
-        if not raw_result or raw_result.get("status") != "succeed" or not raw_result.get("data") or not isinstance(raw_result.get("data"), list) or len(raw_result["data"]) == 0:
-            logger.warning(f"API 响应未通过成功条件检查或未找到结果 ({fanhao}). Data: {raw_result}")
-            error_msg = raw_result.get('message', '未知API错误') if isinstance(raw_result, dict) else '响应格式错误'
-            if raw_result and raw_result.get("status") != "succeed":
-                 return None, f"搜索服务报告错误 (状态: {raw_result.get('status', '未知')})"
-            else:
-                 return None, f"未能找到番号 '{fanhao}' 对应的资源"
+        # --- 处理业务逻辑错误 ---
+        if not raw_result or raw_result.get("status") != "succeed":
+            error_type = raw_result.get('message', '未知错误')
+            if "not found" in error_type.lower():
+                return None, f"🔍 未找到番号 {fanhao} 相关资源"
+            return None, f"🔍 搜索服务异常 ({error_type[:20]}...)"
 
-        # --- Magnet Selection Logic ---
+        if not raw_result.get("data") or len(raw_result["data"]) == 0:
+            return None, f"🔍 番号 {fanhao} 暂无有效磁力"
+
+        # --- 解析数据条目 ---
         parsed_entries = []
         for entry_str in raw_result["data"]:
             parsed = parse_api_data_entry(entry_str)
-            if parsed:
+            if parsed and parsed["magnet"].startswith("magnet:?"):
                 parsed_entries.append(parsed)
 
         if not parsed_entries:
-            logger.error(f"错误: 成功获取 API 数据，但无法解析任何有效条目 ({fanhao})")
-            return None, "找到了资源，但无法解析其详细信息"
+            return None, f"🔍 找到资源但无有效磁力"
 
-        # Find max size for clustering heuristic
-        max_size = 0
-        for entry in parsed_entries:
-             if entry["size_bytes"] > max_size:
-                 max_size = entry["size_bytes"]
-
-        if max_size == 0: # Handle case where all sizes are 0 or unparseable
-             logger.warning(f"无法确定最大文件大小，将使用第一个有效磁链 ({fanhao})")
-             return parsed_entries[0]["magnet"], None # Fallback: return the first one found
-
-
-	# 定义 HD 集群阈值（例如，> 最大尺寸的 70%）
-	# 如果需要，根据典型的尺寸差异调整此阈值 (0.7)
+        # --- 智能选择逻辑（保持原样）---
+        max_size = max(e["size_bytes"] for e in parsed_entries)
         hd_threshold = max_size * 0.7
-        hd_cluster = [entry for entry in parsed_entries if entry["size_bytes"] >= hd_threshold]
+        selected_cluster = [e for e in parsed_entries if e["size_bytes"] >= hd_threshold] or parsed_entries
 
-        selected_cluster = hd_cluster
-        if not hd_cluster:
-            logger.info(f"未找到明显的高清版本 (大小 > {hd_threshold / (1024**3):.2f} GB)，将在所有版本中选择 ({fanhao})")
-            selected_cluster = parsed_entries # Fallback to all entries if no HD cluster
+        selected_cluster.sort(
+            key=lambda x: (x["size_bytes"],
+                         -(x["date"].toordinal() if x["date"] else 0)))
 
-        if not selected_cluster: # Should not happen if parsed_entries was not empty, but safety check
-             logger.error(f"错误: 无法确定选择集群 ({fanhao})")
-             return None, "筛选磁力链接时出错"
+        return selected_cluster[0]["magnet"], None
 
-		# 对所选集群进行排序：
-		# 1. 尺寸最小的优先（在集群内）
-		# 2. 日期最新的优先（作为并列项的打破规则 - 按照示例分析使用最新的）
-		#    对于没有日期的条目，使用非常旧的日期，以便它们在并列打破规则中排在最后。
-        epoch_start_date = datetime(1970, 1, 1).date()
-        selected_cluster.sort(key=lambda x: (x["size_bytes"], -(x["date"].toordinal() if x["date"] else epoch_start_date.toordinal())))
-
-
-        chosen_entry = selected_cluster[0]
-        chosen_magnet = chosen_entry["magnet"]
-
-        logger.info(f"智能选择完成 ({fanhao}):")
-        logger.info(f" - 总共解析条目: {len(parsed_entries)}")
-        logger.info(f" - 最大检测大小: {max_size / (1024**3):.2f} GB")
-        if hd_cluster:
-            logger.info(f" - 高清集群条目数 (> {hd_threshold / (1024**3):.2f} GB): {len(hd_cluster)}")
-        logger.info(f" - 选择标准: {'高清集群' if hd_cluster else '所有版本'}内，优先最小体积，其次最新日期")
-        logger.info(f" - 最终选择: {chosen_entry['name']} ({chosen_entry['size_str']}, {chosen_entry['date_str']})")
-        logger.info(f" - 磁力链接: {chosen_magnet[:60]}...")
-
-        return chosen_magnet, None
-        # --- End Magnet Selection Logic ---
-
+    # --- 异常处理（优化提示）---
     except requests.exceptions.Timeout:
-        logger.error(f"获取磁力链接时超时 ({fanhao})")
-        return None, "搜索番号超时，请稍后再试"
-    except requests.exceptions.RequestException as e:
-        logger.error(f"获取磁力链接时网络出错 ({fanhao}): {str(e)}")
-        return None, "搜索服务连接失败，请检查网络或稍后再试"
+        logger.error(f"搜索超时 ({fanhao})")
+        return None, "⏳ 搜索超时，请检查网络连接"
+
+    except requests.exceptions.HTTPError as e:
+        # 确保 e.response 存在
+        status_code = e.response.status_code  # 正确引用 e.response
+        if 500 <= status_code < 600 or status_code == 404:
+            return None, f"🔍 番号 {fanhao} 不存在"
+        return None, f"🔍 搜索服务异常 (HTTP {status_code})"
+
     except Exception as e:
-        logger.error(f"获取磁力链接时发生未知错误 ({fanhao}): {str(e)}", exc_info=True)
-        return None, "搜索过程中发生内部错误"
+        logger.error(f"未知错误 ({fanhao}): {str(e)}", exc_info=True)
+        if "timed out" in str(e).lower():
+            return None, "⏳ 操作超时，请稍后重试"
+        return None, "🔍 搜索时发生意外错误"
 
 async def get_token(context: ContextTypes.DEFAULT_TYPE) -> str | None:
-    """获取 Alist Token，优先从 context.bot_data 获取，否则登录获取"""
+    """获取 Alist Token，带有效期缓存"""
     bot_data = context.bot_data
     token = bot_data.get("alist_token")
+    token_expiry = bot_data.get("token_expiry")
 
-    if token:
-        # 可选：在这里添加一个简单的测试请求来验证 token 是否仍然有效
-        # 如果无效，设置 token = None，强制重新登录
-        logger.info("使用缓存的 Alist token")
+    if token and token_expiry and datetime.now() < token_expiry:
+        logger.info("使用有效缓存的 Alist token")
         return token
 
     try:
         url = BASE_URL.rstrip('/') + "/api/auth/login"
-        logger.info("缓存 token 无效或不存在，正在登录获取新的 Alist token...")
+        logger.info("缓存 token 无效或过期，正在重新获取...")
         login_info = {"username": USERNAME, "password": PASSWORD}
-        loop = asyncio.get_running_loop() # 获取当前事件循环
-        response = await loop.run_in_executor( 
-            None, # 使用默认的 executor
-            lambda: requests.post(url, json=login_info, timeout=15)
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            None, lambda: requests.post(url, json=login_info, timeout=15)
         )
         response.raise_for_status()
 
         result = response.json()
         if result.get("code") == 200 and result.get("data") and result["data"].get("token"):
             token = str(result['data']['token'])
-            logger.info("登录 Alist 成功，已获取并缓存 token")
-            bot_data["alist_token"] = token  # 缓存 token
+            bot_data["alist_token"] = token
+            bot_data["token_expiry"] = datetime.now() + TOKEN_EXPIRY_DURATION
+            logger.info("成功获取并缓存新的 Alist token")
             return token
         else:
             error_msg = result.get('message', '未知错误')
@@ -284,468 +255,701 @@ async def get_token(context: ContextTypes.DEFAULT_TYPE) -> str | None:
         return None
 
 async def add_magnet(context: ContextTypes.DEFAULT_TYPE, token: str, magnet: str) -> tuple[bool, str]:
-    """使用 'storage' 工具添加磁力链接到 Alist 离线下载"""
+    """返回格式：(是否成功, 结果描述)"""
     if not token or not magnet:
-        logger.error("错误: token 或磁力链接为空")
-        # 返回符合 (bool, str) 格式的错误信息
-        return False, "内部错误：Token 或磁力链接为空"
+        logger.error("添加任务失败: token 或磁力链接为空")
+        return False, "❌ 内部错误：必要参数缺失"
 
     try:
-        # 使用全局变量 BASE_URL 和 OFFLINE_DOWNLOAD_DIR
         url = BASE_URL.rstrip('/') + "/api/fs/add_offline_download"
-        logger.info(f"正在添加离线下载任务到目录: {OFFLINE_DOWNLOAD_DIR}")
-
         headers = {
             "Authorization": token,
             "Content-Type": "application/json"
         }
-        # --- 修改 post_data ---
         post_data = {
             "path": OFFLINE_DOWNLOAD_DIR,
             "urls": [magnet],
-            "tool": "storage",  # <--- 这里修改为 "storage"
-            "delete_policy": "delete_on_upload_succeed" # 和你提供的示例一致
+            "tool": "storage",
+            "delete_policy": "delete_on_upload_succeed"
         }
-        # --- 修改结束 ---
 
-        loop = asyncio.get_running_loop() # 获取当前事件循环
-        # --- 保留异步执行 ---
+        loop = asyncio.get_running_loop()
         response = await loop.run_in_executor(
-             None, # 使用默认的 executor
-             lambda: requests.post(url, json=post_data, headers=headers, timeout=30) # 增加超时时间
-        )
-        # --- 异步执行结束 ---
+            None, lambda: requests.post(url, json=post_data, headers=headers, timeout=30))
 
+        # 处理已知错误状态
         if response.status_code == 401:
-            logger.warning("Alist token 可能已过期或无效 (收到 401)")
             context.bot_data.pop("alist_token", None)
-            # 用户友好的错误
-            return False, "❌ Alist 认证失败，Token 可能已过期，请稍后重试"
+            return False, "❌ 认证过期，请重试"
+        if response.status_code == 500:
+            return False, "❌ 服务器拒绝请求（可能重复添加）"
 
         response.raise_for_status()
         result = response.json()
 
         if result.get("code") == 200:
-            logger.info("离线下载任务添加成功!")
-            # 成功的消息
-            return True, "✅ 离线下载任务添加成功！"
-        else:
-            error_msg = result.get('message', '未知错误')
-            logger.error(f"添加 Alist 离线下载任务失败: {error_msg} (Code: {result.get('code', 'N/A')})")
-            # 用户友好的错误 - 从 Alist API 获取的消息可能已经比较清晰
-            return False, f"❌ 添加任务失败: {error_msg}"
+            return True, "✅ 已添加至下载队列"
+        return False, f"❌ 磁力解析失败"
 
     except requests.exceptions.Timeout:
-        logger.error("添加 Alist 离线下载任务时超时")
-        # 用户友好的错误
-        return False, "❌ 添加任务超时，请检查 Alist 服务状态"
-    except requests.exceptions.RequestException as e:
-        logger.error(f"添加 Alist 离线下载任务时出错: {str(e)}")
-        if "Connection refused" in str(e) or "Failed to establish a new connection" in str(e):
-             # 用户友好的错误
-             return False, "❌ 添加任务失败: 无法连接到 Alist 服务，请检查其是否运行"
-        # 用户友好的错误
-        return False, f"❌ 添加任务时网络出错: 请检查网络连接或 Alist 地址"
+        return False, "⏳ 添加超时，请检查网络"
+    except requests.exceptions.ConnectionError:
+        return False, "🔌 无法连接Alist服务"
     except Exception as e:
-        logger.error(f"添加 Alist 离线下载任务时发生未知错误: {str(e)}", exc_info=True)
-        # 用户友好的错误
-        return False, "❌ 添加任务时发生内部错误"
+        logger.error(f"添加任务异常: {str(e)}")
+        return False, f"❌ 意外错误: {str(e)[:50]}"
 
-async def find_download_directory(token: str, base_url: str, parent_dir: str, original_code: str) -> tuple[str | None, str | None]:
-    """
-    Searches for a directory within parent_dir that matches the original_code.
-
-    Args:
-        token: Alist auth token.
-        base_url: Alist base URL.
-        parent_dir: The base directory where downloads are stored (e.g., OFFLINE_DOWNLOAD_DIR).
-        original_code: The code provided by the user (e.g., 'SONE-622').
-
-    Returns:
-        tuple[str | None, str | None]: (found_path, error_message)
-        - If exactly one match is found, returns (full_path, None).
-        - If no matches or multiple matches are found, or an error occurs, returns (None, error_message).
-    """
-    logger.info(f"在 '{parent_dir}' 中搜索与 '{original_code}' 匹配的目录...")
+async def recursive_collect_files(token: str, base_url: str, current_path: str) -> list[str]:
+    """递归收集目录下所有小文件（返回绝对路径）"""
+    if SIZE_THRESHOLD == 0:
+        return []
     list_url = base_url.rstrip('/') + "/api/fs/list"
     headers = {"Authorization": token, "Content-Type": "application/json"}
-    list_payload = {"path": parent_dir, "page": 1, "per_page": 0} # Get all items
+    payload = {"path": current_path, "page": 1, "per_page": 0}
+    files = []
 
     try:
         loop = asyncio.get_running_loop()
-        response_list = await loop.run_in_executor(
-            None, lambda: requests.post(list_url, json=list_payload, headers=headers, timeout=20)
+        response = await loop.run_in_executor(
+            None, lambda: requests.post(list_url, json=payload, headers=headers, timeout=20)
         )
-        response_list.raise_for_status()
-        list_result = response_list.json()
+        response.raise_for_status()
+        list_result = response.json()
 
-        if list_result.get("code") != 200 or not list_result.get("data") or list_result["data"].get("content") is None:
-            msg = f"无法列出父目录 '{parent_dir}' 的内容: {list_result.get('message', '未知错误')}"
-            logger.error(msg)
-            return None, msg
+        # 防御性数据解析
+        data = list_result.get("data") or {}
+        if list_result.get("code") != 200:
+            logger.error(f"目录列表失败: {list_result.get('message')} (路径: {current_path})")
+            return []
 
-        content = list_result["data"]["content"]
-        if not content:
-            msg = f"父目录 '{parent_dir}' 为空或无法访问。"
-            logger.warning(msg)
-            return None, msg
+        content = data.get("content") or []
+        if not isinstance(content, list):
+            logger.error(f"无效的API响应格式 (路径: {current_path})")
+            return []
 
+        for item in content:
+            # 关键路径处理逻辑
+            try:
+                is_dir = item.get("is_dir", False)
+                file_name = item.get("name", "").strip()
+                file_size = item.get("size", 0)
+
+                if not file_name:
+                    continue
+
+                # 构建标准化绝对路径（兼容Windows/Linux）
+                full_path = "/".join([current_path.rstrip("/"), file_name.lstrip("/")])
+
+                if is_dir:
+                    # 递归处理目录
+                    sub_files = await recursive_collect_files(token, base_url, full_path)
+                    files.extend(sub_files)
+                else:
+                    # 只收集小于阈值文件
+                    if file_size < SIZE_THRESHOLD:
+                        files.append(full_path)
+                        logger.debug(f"找到候选文件: {full_path} ({file_size/1024/1024:.2f} MB)")
+
+            except Exception as e:
+                logger.error(f"处理文件项时出错: {str(e)}", exc_info=True)
+                continue
+
+        return files
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"网络请求失败: {str(e)} (路径: {current_path})")
+        return []
+    except Exception as e:
+        logger.error(f"未知错误: {str(e)} (路径: {current_path})", exc_info=True)
+        return []
+
+async def recursive_collect_empty_dirs(token: str, base_url: str, current_path: str) -> list[str]:
+    """递归收集目录下所有空文件夹（返回绝对路径）"""
+    list_url = base_url.rstrip('/') + "/api/fs/list"
+    headers = {"Authorization": token, "Content-Type": "application/json"}
+    payload = {"path": current_path, "page": 1, "per_page": 0}
+    empty_dirs = []
+
+    try:
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            None, lambda: requests.post(list_url, json=payload, headers=headers, timeout=20)
+        )
+        response.raise_for_status()
+        list_result = response.json()
+
+        # 防御性数据解析
+        data = list_result.get("data") or {}
+        if list_result.get("code") != 200:
+            logger.error(f"目录列表失败: {list_result.get('message')} (路径: {current_path})")
+            return []
+
+        content = data.get("content") or []
+        if not isinstance(content, list):
+            logger.error(f"无效的API响应格式 (路径: {current_path})")
+            return []
+
+        sub_dirs = []
+        for item in content:
+            is_dir = item.get("is_dir", False)
+            file_name = item.get("name", "").strip()
+            if not file_name:
+                continue
+            full_path = "/".join([current_path.rstrip("/"), file_name.lstrip("/")])
+            if is_dir:
+                sub_dirs.append(full_path)
+        for sub_dir in sub_dirs:
+            sub_empty_dirs = await recursive_collect_empty_dirs(token, base_url, sub_dir)
+            empty_dirs.extend(sub_empty_dirs)
+
+        if not sub_dirs and not any(not item.get("is_dir", False) for item in content):
+            empty_dirs.append(current_path)
+
+        return empty_dirs
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"网络请求失败: {str(e)} (路径: {current_path})")
+        return []
+    except Exception as e:
+        logger.error(f"未知错误: {str(e)} (路径: {current_path})", exc_info=True)
+        return []
+
+
+async def cleanup_empty_dirs(token: str, base_url: str, target_dir: str) -> tuple[int, str]:
+    """清理空文件夹并返回成功删除的文件夹数+结果信息"""
+    try:
+        empty_dirs = await recursive_collect_empty_dirs(token, base_url, target_dir)
+        if not empty_dirs:
+            return 0, "✅ 未找到空文件夹"
+
+        total_deleted = 0
+        error_messages = []
+        for dir_path in empty_dirs:
+            try:
+                remove_url = base_url.rstrip('/') + "/api/fs/remove"
+                headers = {"Authorization": token, "Content-Type": "application/json"}
+                delete_payload = {
+                    "dir": os.path.dirname(dir_path),
+                    "names": [os.path.basename(dir_path)]
+                }
+                response = requests.post(remove_url, json=delete_payload, headers=headers, timeout=30)
+                if response.status_code == 200:
+                    result = response.json()
+                    if result.get("code") == 200:
+                        total_deleted += 1
+                        logger.debug(f"成功删除空文件夹: {dir_path}")
+                    else:
+                        error_msg = result.get("message", "未知错误")
+                        error_messages.append(f"文件夹 {os.path.basename(dir_path)}: {error_msg}")
+                else:
+                    response.raise_for_status()
+            except requests.exceptions.RequestException as e:
+                error_messages.append(f"文件夹 {os.path.basename(dir_path)}: 网络错误")
+            except Exception as e:
+                error_messages.append(f"文件夹 {os.path.basename(dir_path)}: {str(e)}")
+
+        if error_messages:
+            return total_deleted, (
+                f"❌ 部分删除失败 (成功 {total_deleted} 文件夹)\n"
+                f"错误({min(len(error_messages), 3)}/{len(error_messages)}):\n" +
+                "\n".join([f"• {msg}" for msg in error_messages[:3]])
+            )
+
+        return total_deleted, f"✅ 成功删除 {total_deleted} 个空文件夹"
+
+    except Exception as e:
+        logger.error(f"清理空文件夹异常: {str(e)}", exc_info=True)
+        return 0, f"❌ 系统错误: {str(e)}"
+
+
+async def cleanup_small_files(token: str, base_url: str, target_dir: str) -> tuple[int, str]:
+    if SIZE_THRESHOLD == 0:
+        return 0, "✅ 小文件清理功能未启用"
+    try:
+        from collections import defaultdict
+        import os
+        from urllib.parse import quote
+
+        logger.info(f"开始清理目录: {target_dir}")
+        files_to_delete = await recursive_collect_files(token, base_url, target_dir)
+
+        if not files_to_delete:
+            return 0, "✅ 未找到小于指定大小的文件"
+
+        # 按父目录分组文件
+        dir_files = defaultdict(list)
+        for abs_path in files_to_delete:
+            parent_dir = os.path.dirname(abs_path)
+            file_name = os.path.basename(abs_path)
+            dir_files[parent_dir].append(file_name)
+
+        total_deleted_files = 0
+        file_error_messages = []
+
+        # 分目录批量删除
+        for parent_dir, file_names in dir_files.items():
+            try:
+                remove_url = base_url.rstrip('/') + "/api/fs/remove"
+                headers = {"Authorization": token, "Content-Type": "application/json"}
+
+                # URL编码处理（兼容特殊字符）
+                encoded_dir = quote(parent_dir, safe='')
+                encoded_names = [quote(name, safe='') for name in file_names]
+
+                delete_payload = {
+                    "dir": parent_dir,
+                    "names": file_names
+                }
+
+                response = requests.post(remove_url, json=delete_payload, headers=headers, timeout=30)
+
+                if response.status_code == 200:
+                    result = response.json()
+                    if result.get("code") == 200:
+                        deleted = len(file_names)
+                        total_deleted_files += deleted
+                        logger.debug(f"成功删除 {deleted} 个文件于 {parent_dir}")
+                    else:
+                        # 记录更详细的错误信息
+                        error_msg = f"目录 {os.path.basename(parent_dir)}: API 返回错误码 {result.get('code')}，消息: {result.get('message')}"
+                        file_error_messages.append(error_msg)
+                else:
+                    response.raise_for_status()
+
+            except requests.exceptions.RequestException as e:
+                error_msg = f"目录 {os.path.basename(parent_dir)}: 网络错误 - {str(e)}"
+                file_error_messages.append(error_msg)
+            except Exception as e:
+                error_msg = f"目录 {os.path.basename(parent_dir)}: {str(e)}"
+                file_error_messages.append(error_msg)
+
+        # 清理完小文件后，继续清理空文件夹
+        total_deleted_dirs, dir_msg = await cleanup_empty_dirs(token, base_url, target_dir)
+
+        # 生成结果信息
+        if file_error_messages and total_deleted_files == 0 and total_deleted_dirs == 0:
+            return 0, (
+                f"❌ 部分删除失败 (成功 0 个文件和 0 个空文件夹)\n"
+                f"错误({min(len(file_error_messages), 3)}/{len(file_error_messages)}):\n" +
+                "\n".join([f"• {msg}" for msg in file_error_messages[:3]])
+            )
+
+        if total_deleted_files > 0 or total_deleted_dirs > 0:
+            if total_deleted_dirs > 0:
+                if file_error_messages:
+                    return total_deleted_files, (
+                        f"✅ 部分文件删除失败，但成功删除 {total_deleted_files} 个文件和 {total_deleted_dirs} 个空文件夹\n"
+                        f"文件删除错误({min(len(file_error_messages), 3)}/{len(file_error_messages)}):\n" +
+                        "\n".join([f"• {msg}" for msg in file_error_messages[:3]])
+                    )
+                else:
+                    return total_deleted_files, f"✅ 成功删除 {total_deleted_files} 个文件和 {total_deleted_dirs} 个空文件夹"
+            else:
+                if file_error_messages:
+                    return total_deleted_files, (
+                        f"✅ 部分文件删除失败，但成功删除 {total_deleted_files} 个文件\n"
+                        f"文件删除错误({min(len(file_error_messages), 3)}/{len(file_error_messages)}):\n" +
+                        "\n".join([f"• {msg}" for msg in file_error_messages[:3]])
+                    )
+                else:
+                    return total_deleted_files, f"✅ 成功删除 {total_deleted_files} 个文件。{dir_msg}"
+        else:
+            return 0, f"✅ 未找到小于指定大小的文件，{dir_msg}"
+
+    except Exception as e:
+        logger.error(f"清理异常: {str(e)}", exc_info=True)
+        return 0, f"❌ 系统错误: {str(e)}"
+
+
+async def find_download_directory(token: str, base_url: str, parent_dir: str, original_code: str) -> tuple[list[str] | None, str | None]:
+    """返回所有匹配的目录列表"""
+    logger.info(f"在目录 '{parent_dir}' 中搜索番号 '{original_code}'...")
+    list_url = base_url.rstrip('/') + "/api/fs/list"
+    headers = {"Authorization": token, "Content-Type": "application/json"}
+
+    try:
+        # 路径标准化处理
+        parent_dir = parent_dir.strip().replace('\\', '/').rstrip('/')
+        if not parent_dir.startswith('/'):
+            parent_dir = f'/{parent_dir}'
+
+        list_payload = {"path": parent_dir, "page": 1, "per_page": 0}
+        response = requests.post(list_url, json=list_payload, headers=headers, timeout=20)
+        response.raise_for_status()
+        list_result = response.json()
+
+        if list_result.get("code") != 200:
+            return None, f"目录列表失败: {list_result.get('message', '未知错误')}"
+
+        content = list_result.get("data", {}).get("content", [])
+        target_pattern = re.sub(r'[^a-zA-Z0-9]', '', original_code).lower()
         possible_matches = []
-        lower_code = original_code.lower()
 
         for item in content:
             if item.get("is_dir"):
-                dir_name = item.get("name")
-                if dir_name:
-                    # Match if the directory name starts with the code (case-insensitive)
-                    if dir_name.lower().startswith(lower_code):
-                        # Construct the full path for the match
-                        full_path = parent_dir.rstrip('/') + '/' + dir_name
-                        possible_matches.append({"name": dir_name, "path": full_path})
-                        logger.debug(f"找到潜在匹配目录: {full_path}")
+                dir_name = item.get("name", "").strip()
+                normalized_dir = re.sub(r'[^a-zA-Z0-9]', '', dir_name).lower()
+                if normalized_dir.startswith(target_pattern):
+                    full_path = f"{parent_dir.rstrip('/')}/{dir_name}".replace('//', '/')
+                    possible_matches.append(full_path)
+                    logger.debug(f"找到候选目录: {full_path}")
 
-        if len(possible_matches) == 1:
-            found = possible_matches[0]
-            logger.info(f"找到唯一匹配目录: {found['path']}")
-            return found['path'], None
-        elif len(possible_matches) == 0:
-            msg = f"在 '{parent_dir}' 中未找到任何以 '{original_code}' 开头的目录。"
-            logger.warning(msg)
-            return None, msg
-        else:
-            match_names = [m['name'] for m in possible_matches]
-            msg = f"找到多个可能的目录: {match_names}。请确认具体是哪一个或手动清理。"
-            logger.warning(msg)
-            return None, msg
+        return possible_matches, None
 
-    except requests.exceptions.Timeout:
-        msg = f"查找目录时请求超时 (与 Alist 通信时)"
-        logger.error(msg)
-        return None, msg
-    except requests.exceptions.RequestException as e:
-        msg = f"查找目录时发生网络错误: {e}"
-        logger.error(msg)
-        return None, msg
     except Exception as e:
-        msg = f"查找目录时发生未知错误: {e}"
-        logger.error(msg, exc_info=True)
-        return None, msg
+        logger.error(f"目录搜索异常: {str(e)}")
+        return None, f"目录搜索失败: {str(e)}"
 
 
-# --- 广告文件清理函数 ---
-
-# 定义广告文件的模式和关键词
-# 根据观察，使这些内容更全面
-AD_KEYWORDS = ["直播", "聚合", "社区", "情报", "最新地址", "獲取", "花式表演", "大全", "群淫傳", "三國志H版", "七龍珠H版"] # Add more common ad phrases
-AD_DOMAINS = ["996gg.cc"] # Add known ad domains found in filenames
-AD_EXTENSIONS = {".txt", ".html", ".htm", ".url", ".lnk", ".apk", ".exe"} # Extensions often used for ads/junk
-MEDIA_EXTENSIONS = {".mp4", ".mkv", ".avi", ".wmv", ".mov", ".flv", ".rmvb"} # Common video extensions to keep
-
-async def cleanup_ad_files(token: str, base_url: str, directory_path: str, original_code: str):
-    """
-    Lists files in a directory via Alist API, identifies, and deletes ad files.
-    Args:
-        token: Alist auth token.
-        base_url: Alist base URL.
-        directory_path: The path within Alist where the download finished.
-        original_code: The original search code (e.g., 'SONE-622') used for identifying main files.
-    Returns:
-        tuple[bool, str]: (success_status, message)
-    """
-    logger.info(f"开始清理目录 '{directory_path}' 中的广告文件 (基于番号: {original_code})")
-
-    list_url = base_url.rstrip('/') + "/api/fs/list"
-    remove_url = base_url.rstrip('/') + "/api/fs/remove"
-    headers = {"Authorization": token, "Content-Type": "application/json"}
-
-    try:
-        # 1. List files in the directory
-        list_payload = {"path": directory_path, "page": 1, "per_page": 0} # Get all files
-        loop = asyncio.get_running_loop()
-        response_list = await loop.run_in_executor(
-            None, lambda: requests.post(list_url, json=list_payload, headers=headers, timeout=20)
-        )
-        response_list.raise_for_status()
-        list_result = response_list.json()
-
-        if list_result.get("code") != 200 or not list_result.get("data") or list_result["data"].get("content") is None:
-            msg = f"无法列出目录 '{directory_path}' 的内容: {list_result.get('message', '未知错误')}"
-            logger.error(msg)
-            return False, f"❌ 清理失败: {msg}"
-
-        files_to_check = list_result["data"]["content"]
-        if not files_to_check:
-            logger.info(f"目录 '{directory_path}' 为空，无需清理。")
-            return True, "✅ 目录为空，无需清理。"
-
-        # Prepare original code for matching (lowercase, remove hyphen for broader match)
-        match_code = original_code.lower().replace('-', '')
-
-        files_to_delete = []
-        files_kept = []
-
-        # 2. Identify files to delete
-        for file_info in files_to_check:
-            if file_info.get("is_dir"): # Skip directories
-                continue
-
-            filename = file_info.get("name")
-            if not filename:
-                continue
-
-            base_name, extension = os.path.splitext(filename)
-            extension = extension.lower()
-            lower_filename = filename.lower()
-            lower_basename = base_name.lower()
-
-            # Rule 1: Check if it's a primary media file to KEEP
-            keep_file = False
-            if extension in MEDIA_EXTENSIONS:
-                # Check if filename contains the essential code part
-                # (e.g., 'sone622' is in 'sone-622ch.mp4')
-                # Make matching more robust if needed (e.g., allow only prefix/suffix)
-                if match_code in lower_basename.replace('-', ''):
-                    keep_file = True
-                    files_kept.append(filename)
-                    logger.debug(f"保留主媒体文件: {filename}")
-
-            # Rule 2: If not explicitly kept, check if it matches AD criteria
-            delete_file = False
-            if not keep_file:
-                if extension in AD_EXTENSIONS:
-                    delete_file = True
-                    logger.debug(f"标记删除 (广告扩展名): {filename}")
-                elif any(keyword in filename for keyword in AD_KEYWORDS): # Check full name for keywords
-                    delete_file = True
-                    logger.debug(f"标记删除 (广告关键词): {filename}")
-                elif any(domain in lower_filename for domain in AD_DOMAINS):
-                    delete_file = True
-                    logger.debug(f"标记删除 (广告域名): {filename}")
-                # Add more specific rules if needed
-
-            if delete_file:
-                files_to_delete.append(filename)
-
-        if not files_to_delete:
-            logger.info(f"在 '{directory_path}' 中未找到需要删除的广告文件。保留的文件: {files_kept}")
-            return True, "✅ 未找到广告文件，无需清理。"
-
-        logger.info(f"准备删除以下文件: {files_to_delete}")
-
-        # 3. Delete identified files
-        deleted_count = 0
-        delete_errors = []
-        for filename_to_delete in files_to_delete:
-             delete_payload = {
-                "dir": directory_path,
-                "names": [filename_to_delete]
-            }
-        try:
-                response_remove = await loop.run_in_executor(
-                    None, lambda: requests.post(remove_url, json=delete_payload, headers=headers, timeout=15)
-                )
-                remove_result = response_remove.json()
-                if remove_result.get("code") == 200:
-                    logger.info(f"成功删除文件: {os.path.join(directory_path, filename_to_delete)}")
-                    deleted_count += 1
-                else:
-                    err_msg = f"删除 '{filename_to_delete}' 失败: {remove_result.get('message', '未知错误')} (Code: {remove_result.get('code')})"
-                    logger.error(err_msg)
-                    delete_errors.append(err_msg)
-        except Exception as e:
-                err_msg = f"删除 '{filename_to_delete}' 时发生请求错误: {e}"
-                logger.error(err_msg, exc_info=True)
-                delete_errors.append(err_msg)
-
-        except Exception as e: # --- Check this inner except block ---
-                # Ensure this except line is correctly indented relative to its 'try'
-                err_msg = f"删除 '{filename_to_delete}' 时发生请求错误: {e}"
-                 # Ensure the next two lines are correctly indented and have no syntax errors
-                logger.error(err_msg, exc_info=True)
-                delete_errors.append(err_msg)
-
-        # 4. Report result
-        if not delete_errors:
-            msg = f"✅ 成功清理 {deleted_count} 个广告文件。"
-            logger.info(msg + f" 保留的文件: {files_kept}")
-            return True, msg
-        else:
-            msg = f"⚠️ 清理完成，但有 {len(delete_errors)} 个文件删除失败 (共识别 {len(files_to_delete)} 个)。成功删除 {deleted_count} 个。"
-            logger.error(msg + f" 错误详情: {delete_errors}")
-            return False, msg
-
-    except requests.exceptions.Timeout:
-        msg = f"清理操作超时 (与 Alist 通信时)"
-        logger.error(msg)
-        return False, f"❌ 清理失败: {msg}"
-    except requests.exceptions.RequestException as e:
-        msg = f"清理操作时发生网络错误: {e}"
-        logger.error(msg)
-        return False, f"❌ 清理失败: {msg}"
-    except Exception as e:
-        msg = f"清理操作时发生未知错误: {e}"
-        logger.error(msg, exc_info=True)
-        return False, f"❌ 清理失败: {msg}"
-
-
-# --- Telegram 机器人命令处理函数 ---
+# --- Telegram 命令处理函数 ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """发送开始消息"""
     user_id = update.effective_user.id
     if user_id not in ALLOWED_USER_IDS:
-         await update.message.reply_text("抱歉，您没有权限使用此机器人。")
-         return
+        await update.message.reply_text("抱歉，您没有权限使用此机器人。")
+        return
     await update.message.reply_text(
         '欢迎使用 JAV 下载机器人！\n'
         '直接发送番号（如 ABC-123）或磁力链接，我会帮你添加到 Alist 离线下载。\n'
         '/help 查看帮助。'
     )
 
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """发送帮助信息"""
     user_id = update.effective_user.id
     if user_id not in ALLOWED_USER_IDS:
-         await update.message.reply_text("抱歉，您没有权限使用此机器人。")
-         return
+        await update.message.reply_text("抱歉，您没有权限使用此机器人。")
+        return
     await update.message.reply_text(
         '使用方法：\n'
         '1. 直接发送番号（例如：`ABC-123`, `IPX-888`）\n'
         '2. 直接发送磁力链接（以 `magnet:?` 开头）\n\n'
-        '3. 使用/clean 加番号名清理广告文件（例如 /clean IPX-888）\n\n'
-        '机器人会自动搜索番号对应的磁力链接（如果输入的是番号），然后将磁力链接添加到 Alist 的离线下载队列中。\n'
-        f'当前配置的下载目录: `{OFFLINE_DOWNLOAD_DIR}`',
+        '3. 清理功能：\n'
+        '   - `/clean <番号>` 清理该番号对应的下载目录\n'
+        '   - `/clean /` 递归清理所有下载目录（谨慎使用！）\n\n'
+        '4. 刷新功能：\n'
+        '   - `/refresh` 刷新 Alist 文件列表\n\n'
+        f'当前配置的下载根目录: `{OFFLINE_DOWNLOAD_DIR}`',
         parse_mode='Markdown'
     )
 
-# 番号格式的简单正则表达式 (可以根据需要调整)
-# 匹配常见的格式，如 XXX-123, XXX123, XXX 123
-FANHAO_REGEX = re.compile(r'^[A-Za-z]{2,5}[- ]?\d{2,5}$', re.IGNORECASE)
 
-@restricted # 应用权限检查和 token 获取
-async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, token: str) -> None:
-    message_text = update.message.text.strip()
-    magnet = None
-    search_needed = False
-    processing_msg = None # 初始化 processing_msg
-    chat_id = update.effective_chat.id # 获取 chat_id 以便发送 action
+FANHAO_REGEX = re.compile(
+    r'^[A-Za-z]{2,5}[-_ ]?\d{2,5}(?:[-_ ]?[A-Za-z])?$',
+    re.IGNORECASE
+)
 
-    if message_text.startswith("magnet:?"):
-        logger.info(f"收到磁力链接: {message_text[:50]}...")
-        magnet = message_text
-        # 发送初始消息
-        processing_msg = await update.message.reply_text("🔗 收到磁力链接，准备添加...")
 
-    elif FANHAO_REGEX.match(message_text):
-        logger.info(f"收到可能的番号: {message_text}")
-        search_needed = True
-        # 发送初始消息
-        processing_msg = await update.message.reply_text(f"🔍 正在搜索番号: {message_text}...")
+# 新增：处理单条输入的函数
+async def handle_single_entry(update: Update, context: ContextTypes.DEFAULT_TYPE, token: str, entry: str):
+    chat_id = update.effective_chat.id
+    loop = asyncio.get_event_loop()
+    processing_msg = None
 
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    try:
+        if entry.startswith("magnet:?"):
+            logger.info(f"收到磁力链接: {entry[:50]}...")
+            processing_msg = await update.message.reply_text("🔗 收到磁力链接，准备添加...")
+            success, result_msg = await add_magnet(context, token, entry)
+        elif FANHAO_REGEX.match(entry):
+            logger.info(f"收到可能的番号: {entry}")
+            processing_msg = await update.message.reply_text(f"🔍 正在搜索番号: {entry}...")
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
-        loop = asyncio.get_running_loop()
-        try:
+            # 同步函数转异步执行
             magnet, error_msg = await loop.run_in_executor(
-                None, lambda: get_magnet(message_text, SEARCH_URL)
+                None, lambda: get_magnet(entry, SEARCH_URL)
             )
-        except Exception as e:
-             logger.error(f"执行 get_magnet 时发生意外错误: {e}", exc_info=True)
-             magnet, error_msg = None, "搜索过程中发生内部错误"
 
-        if not magnet:
-            await processing_msg.edit_text(f"❌ 搜索失败: {error_msg}")
+            if not magnet:
+                await processing_msg.edit_text(f"❌ 搜索失败: {error_msg}")
+                return
+
+            await processing_msg.edit_text(f"✅ 已找到磁力链接，正在添加到 Alist...")
+            success, result_msg = await add_magnet(context, token, magnet)
+        else:
+            await update.message.reply_text("无法识别的消息格式。请发送番号（如 ABC-123）或磁力链接。")
             return
 
-        await processing_msg.edit_text(f"✅ 已找到磁力链接，正在添加到 Alist...")
+        if processing_msg:
+            await processing_msg.edit_text(result_msg)
+        else:
+            await update.message.reply_text(result_msg)
 
-    else:
-        logger.warning(f"收到无法识别的消息格式: {message_text}")
-        await update.message.reply_text("无法识别的消息格式。请发送番号（如 ABC-123）或磁力链接。")
-        return
+        if success:
+            await asyncio.sleep(3)
+            await refresh_command(update, context)
 
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    except Exception as e:
+        logger.error(f"处理异常: {str(e)}", exc_info=True)
+        error_msg = f"❌ 处理失败: {str(e)[:100]}"
+        if processing_msg:
+            await processing_msg.edit_text(error_msg)
+        else:
+            await update.message.reply_text(error_msg)
 
-    success, result_msg = await add_magnet(context, token, magnet)
 
-    if processing_msg:
-        await processing_msg.edit_text(result_msg)
-    else:
-        # 如果是直接处理磁链且没有编辑对象，则回复
-        await update.message.reply_text(result_msg)
-        
-        
-@restricted # Apply permission check and token injection
-async def clean_command(update: Update, context: ContextTypes.DEFAULT_TYPE, token: str) -> None:
-    """
-    Finds the download directory associated with a code and cleans ad files.
-    Usage: /clean <CODE>
-    Example: /clean SONE-622
-    Searches in OFFLINE_DOWNLOAD_DIR for a folder starting with <CODE>.
-    """
-    if not context.args:
-        await update.message.reply_text(
-            "请提供要清理的番号代码。\n"
-            "用法: `/clean <番号代码>`\n"
-            "例如: `/clean SONE-622`\n"
-            f"机器人将在 `{OFFLINE_DOWNLOAD_DIR}` 中搜索匹配的目录进行清理。",
-            parse_mode='Markdown'
-        )
-        return
-
-    original_code = context.args[0].strip()
+# 新增：处理批量输入的函数
+async def handle_batch_entries(update: Update, context: ContextTypes.DEFAULT_TYPE, token: str, entries: list[str]):
     chat_id = update.effective_chat.id
+    loop = asyncio.get_running_loop()
+    progress_msg = await update.message.reply_text(f"🔄 开始批量处理 {len(entries)} 个任务...")
+    results = []
+    BATCH_DELAY = 0.8
 
-    logger.info(f"收到清理请求: code='{original_code}', 基础目录='{OFFLINE_DOWNLOAD_DIR}'")
+    for idx, entry in enumerate(entries, 1):
+        try:
+            # 更新进度消息
+            success_count = sum(1 for res in results if res[1])
+            await progress_msg.edit_text(
+                f"⏳ 处理进度: {idx}/{len(entries)}\n"
+                f"当前项: {entry[:15]}...\n"
+                f"成功: {success_count} 失败: {len(results)-success_count}"
+            )
 
-    # Send initial message and typing action
-    processing_msg = await update.message.reply_text(f"🔍 正在查找与 '{original_code}' 匹配的下载目录...")
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            # 处理逻辑
+            if entry.startswith("magnet:?"):
+                success, msg = await add_magnet(context, token, entry)
+                results.append((entry, success, msg))
+            elif FANHAO_REGEX.match(entry):
+                magnet, error = await loop.run_in_executor(None, lambda: get_magnet(entry, SEARCH_URL))
+                if magnet:
+                    success, msg = await add_magnet(context, token, magnet)
+                    results.append((entry, success, msg))
+                else:
+                    results.append((entry, False, f"搜索失败: {error}"))
+            else:
+                results.append((entry, False, "格式错误"))
 
-    # --- Step 1: Find the actual directory ---
-    # Pass the BASE Alist URL and the PARENT download directory
-    directory_to_clean, find_error = await find_download_directory(token, BASE_URL, OFFLINE_DOWNLOAD_DIR, original_code)
+            await asyncio.sleep(BATCH_DELAY)
 
-    if find_error:
-        await processing_msg.edit_text(f"❌ 查找目录失败: {find_error}")
+        except Exception as e:
+            logger.error(f"批量处理异常: {entry} - {str(e)}")
+            results.append((entry, False, f"处理异常: {str(e)[:50]}"))
+            await asyncio.sleep(BATCH_DELAY * 2)
 
-    # --- Step 2: If directory found, proceed with cleanup ---
-    logger.info(f"找到目标目录 '{directory_to_clean}'，开始清理广告文件...")
-    escaped_path = html.escape(directory_to_clean) # 转义 HTML 特殊字符
-    await processing_msg.edit_text(
-    f"🧹 已找到目录: <code>{escaped_path}</code>\n正在清理广告文件...", 
-    parse_mode=ParseMode.HTML
-)
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    # 生成统计报告
+    success_count = sum(1 for res in results if res[1])
+    report = [
+        f"✅ 批量处理完成 ({success_count}/{len(entries)})",
+        "━━━━━━━━━━━━━━━",
+        *[f"{'🟢' if res[1] else '🔴'} {res[0][:20]}... | {res[2][:30]}"
+          for res in results[:10]],  # 显示前10条结果
+        "━━━━━━━━━━━━━━━",
+        f"成功: {success_count} 条 | 失败: {len(entries)-success_count} 条"
+    ]
+    if len(results) > 10:
+        report.insert(3, f"（仅显示前10条结果，共{len(entries)}条）")
 
-    success, message = await cleanup_ad_files(token, BASE_URL, directory_to_clean, original_code)
+    await progress_msg.edit_text("\n".join(report))
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="💡 提示：使用 /clean / 命令可以清理所有垃圾文件",
+        reply_to_message_id=progress_msg.message_id
+    )
 
-    await processing_msg.edit_text(message)
+    if success_count > 0:
+        await asyncio.sleep(3)
+        await refresh_command(update, context)
 
 
+@restricted
+async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, token: str) -> None:
+    message_text = update.message.text.strip()
+    # 分割多行输入并过滤空行
+    entries = [line.strip() for line in message_text.split('\n') if line.strip()]
+    if not entries:
+        await update.message.reply_text("⚠️ 输入内容为空，请发送番号或磁力链接。")
+        return
+
+    if len(entries) == 1:
+        await handle_single_entry(update, context, token, entries[0])
+    else:
+        await handle_batch_entries(update, context, token, entries)
+
+
+@restricted
+async def clean_command(update: Update, context: ContextTypes.DEFAULT_TYPE, token: str) -> None:
+    """自动清理所有匹配目录（带实时进度）"""
+    if SIZE_THRESHOLD == 0:
+        await update.message.reply_text("✅ 小文件清理功能未启用")
+        return
+    if not context.args:
+        await update.message.reply_text("请提供清理参数：/clean <番号> 或 /clean /")
+        return
+
+    target = context.args[0].strip()
+    chat_id = update.effective_chat.id
+    processing_msg = await update.message.reply_text(f"🧹 开始清理任务（目标: {target}）...")
+
+    try:
+        if target == "/":
+            # 全目录清理逻辑
+            deleted_files, msg = await cleanup_small_files(token, BASE_URL, OFFLINE_DOWNLOAD_DIR)
+            final_text = f"全局清理完成\n{msg}"
+            await processing_msg.edit_text(final_text)
+            return
+
+        # 获取所有匹配目录
+        directories, find_error = await find_download_directory(token, BASE_URL, OFFLINE_DOWNLOAD_DIR, target)
+        if not directories:
+            await processing_msg.edit_text(f"❌ 清理失败: {find_error}")
+            return
+
+        logger.info(f"找到 {len(directories)} 个匹配目录，开始批量清理...")
+
+        success_dirs = 0
+        total_files = 0
+        total_dirs = len(directories)
+        error_messages = []
+
+        # 清理所有匹配目录
+        for idx, dir_path in enumerate(directories, 1):
+            await processing_msg.edit_text(
+                f"🧹 正在清理 ({idx}/{total_dirs}): {os.path.basename(dir_path)}..."
+            )
+            deleted, msg = await cleanup_small_files(token, BASE_URL, dir_path)
+            if deleted > 0:
+                success_dirs += 1
+                total_files += deleted
+            if '❌' in msg:
+                error_messages.append(msg)
+
+        # 生成最终报告
+        zero_dirs_count = total_dirs - success_dirs - len(error_messages)
+        if success_dirs > 0 and zero_dirs_count == 0 and len(error_messages) == 0:
+            final_text = (
+                f"✅ 清理完成！共清理 {total_files} 个小文件，涉及 {success_dirs} 个目录。"
+            )
+        elif success_dirs > 0 and zero_dirs_count == 0 and len(error_messages) > 0:
+            final_text = (
+                f"✅ 部分清理完成！成功清理 {total_files} 个小文件，涉及 {success_dirs} 个目录。\n"
+                f"❌ 以下目录清理失败 ({len(error_messages)}):\n" +
+                "\n".join([f"• {msg}" for msg in error_messages[:3]])
+            )
+        elif success_dirs > 0 and zero_dirs_count > 0 and len(error_messages) == 0:
+            final_text = (
+                f"✅ 部分清理完成！成功清理 {total_files} 个小文件，涉及 {success_dirs} 个目录。\n"
+                f"⚠️ 以下目录未找到需要清理的文件 ({zero_dirs_count}):\n" +
+                "\n".join([os.path.basename(d) for d in directories if d not in [d for _, msg in zip(directories, msg) if '✅' in msg]])
+            )
+        elif success_dirs > 0 and zero_dirs_count > 0 and len(error_messages) > 0:
+            final_text = (
+                f"✅ 部分清理完成！成功清理 {total_files} 个小文件，涉及 {success_dirs} 个目录。\n"
+                f"⚠️ 以下目录未找到需要清理的文件 ({zero_dirs_count}):\n" +
+                "\n".join([os.path.basename(d) for d in directories if d not in [d for _, msg in zip(directories, msg) if '✅' in msg]]) +
+                f"\n❌ 以下目录清理失败 ({len(error_messages)}):\n" +
+                "\n".join([f"• {msg}" for msg in error_messages[:3]])
+            )
+        elif success_dirs == 0 and zero_dirs_count == 0 and len(error_messages) > 0:
+            final_text = (
+                f"❌ 清理失败！未成功清理任何目录。\n" +
+                "\n".join([f"• {msg}" for msg in error_messages[:3]])
+            )
+        elif success_dirs == 0 and zero_dirs_count > 0 and len(error_messages) == 0:
+            final_text = (
+                f"⚠️ 所有目录均未找到需要清理的文件 ({total_dirs})。"
+            )
+        elif success_dirs == 0 and zero_dirs_count > 0 and len(error_messages) > 0:
+            final_text = (
+                f"❌ 清理失败！未成功清理任何目录。\n"
+                f"⚠️ 以下目录未找到需要清理的文件 ({zero_dirs_count}):\n" +
+                "\n".join([os.path.basename(d) for d in directories if d not in [d for _, msg in zip(directories, msg) if '✅' in msg]]) +
+                f"\n❌ 以下目录清理失败 ({len(error_messages)}):\n" +
+                "\n".join([f"• {msg}" for msg in error_messages[:3]])
+            )
+        else:
+            final_text = (
+                f"✅ 部分清理完成！成功清理 {total_files} 个小文件，涉及 {success_dirs} 个目录。"
+            )
+
+        await processing_msg.edit_text(final_text)
+
+    except Exception as e:
+        logger.error(f"清理命令异常: {str(e)}", exc_info=True)
+        await processing_msg.edit_text(f"❌ 清理过程中出现未知错误: {str(e)[:50]}")
+
+
+@restricted
+async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE, *, token: str) -> None:
+    """发送刷新请求以刷新 Alist"""
+    refresh_url = BASE_URL.rstrip('/') + "/api/fs/list"
+    headers = {
+        "Authorization": token,
+        "Content-Type": "application/json"
+    }
+    payload = {"path": "/", "page": 1, "per_page": 0}
+    chat_id = update.effective_chat.id
+    processing_msg = await update.message.reply_text("🔄 正在刷新 Alist...")
+
+    try:
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            None, lambda: requests.post(refresh_url, json=payload, headers=headers, timeout=30)
+        )
+        response.raise_for_status()
+        result = response.json()
+
+        if result.get("code") == 200:
+            await processing_msg.edit_text("✅ Alist 刷新成功！")
+        else:
+            error_msg = result.get("message", "未知错误")
+            await processing_msg.edit_text(f"❌ 刷新失败: {error_msg}")
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"刷新 Alist 时出错: {str(e)}")
+        await processing_msg.edit_text(f"❌ 刷新失败: 网络错误 ({str(e)[:50]})")
+    except Exception as e:
+        logger.error(f"刷新 Alist 时发生未知错误: {str(e)}", exc_info=True)
+        await processing_msg.edit_text(f"❌ 刷新失败: 未知错误 ({str(e)[:50]})")
+
+
+# --- 自动清理定时任务 ---
+async def auto_clean(context: ContextTypes.DEFAULT_TYPE):
+    if CLEAN_INTERVAL_MINUTES == 0 or SIZE_THRESHOLD == 0:
+        logger.info("自动清理任务未启用")
+        return
+    token = await get_token(context)
+    if not token:
+        logger.error("无法获取 Alist token，自动清理任务失败。")
+        return
+
+    chat_id = list(ALLOWED_USER_IDS)[0]  # 假设使用第一个允许的用户 ID 发送结果
+    processing_msg = await context.bot.send_message(chat_id=chat_id, text="🧹 开始自动清理任务...")
+
+    try:
+        deleted_files, msg = await cleanup_small_files(token, BASE_URL, OFFLINE_DOWNLOAD_DIR)
+        final_text = f"自动清理完成\n{msg}"
+        await processing_msg.edit_text(final_text)
+    except Exception as e:
+        logger.error(f"自动清理任务异常: {str(e)}", exc_info=True)
+        error_text = [
+            "❌ 自动清理过程发生严重错误",
+            f"错误类型: {type(e).__name__}",
+            f"详细信息: {str(e)}"
+        ]
+        await processing_msg.edit_text("\n".join(error_text))
+
+
+# --- 主函数 ---
 def main() -> None:
     """启动机器人"""
-    logger.info("开始初始化 Telegram 机器人...")
-
-    # 创建应用
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # 添加处理程序
+    # 注册命令处理程序
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("clean", clean_command)) # <-- 添加这一行
-    # Message handler should remain last if it's a catch-all
+    application.add_handler(CommandHandler("clean", clean_command))
+    application.add_handler(CommandHandler("refresh", refresh_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_message))
 
+    # 启动自动清理任务
+    job_queue = application.job_queue
+    job_queue.run_repeating(auto_clean, interval=CLEAN_INTERVAL_MINUTES * 60, first=0)
+
     # 启动机器人
-    logger.info("启动 Telegram 机器人轮询...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling()
+
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        logger.critical(f"程序启动或运行过程中发生严重错误: {str(e)}", exc_info=True)
-        sys.exit(1)
-    finally:
-        logger.info("Telegram 机器人已停止。")
+    main()
